@@ -1,0 +1,36 @@
+# EqualCare
+# Install with:
+#   python -m pip install --upgrade pip
+#   pip install -r backend/requirements.txt
+#
+# NOTE:
+# - This file targets CPU-only PyTorch wheels using the PyTorch CPU index as an extra source.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Backend API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Documents / RAG
+pypdf
+python-docx
+sentence-transformers
+
+# Local runtime
+ollama
+
+# Audio + ASR helpers
+soundfile
+
+# Speaker diarization
+pyannote.audio
+
+# PyTorch (CPU) — pinned
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+
+
+# Transformers pinned to a specific commit
+transformers @ git+https://github.com/huggingface/transformers.git@65dc261512cbdb1ee72b88ae5b222f2605aad8e5
