@@ -1,22 +1,43 @@
+"""
+EqualCare SQLite Layer (db.py)
+
+This module is the single place responsible for:
+- Opening SQLite connections with the correct pragmas (WAL, FK, timeouts).
+- Creating tables on first run (init_db).
+- Providing small, explicit CRUD helpers used by the FastAPI routes/services.
+
+"""
+
+# -----------------------------------------------------------------------------
+# imports
+# -----------------------------------------------------------------------------
 import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
 from .paths import DB_PATH
 
-_DB_TIMEOUT_S = 15
+# -----------------------------------------------------------------------------
+# Module constants & configuration
+# -----------------------------------------------------------------------------
+_DB_TIMEOUT_S = 15   # Connection timeout (seconds).
 
-
+# -----------------------------------------------------------------------------
+# SQLite auxiliary file paths (WAL/SHM)
+# -----------------------------------------------------------------------------
 def _wal_path() -> Path:
+    """Return the expected path to the SQLite WAL file for DB_PATH."""
     return DB_PATH.with_name(DB_PATH.name + "-wal")
 
-
 def _shm_path() -> Path:
+    """Return the expected path to the SQLite SHM file for DB_PATH."""
     return DB_PATH.with_name(DB_PATH.name + "-shm")
 
-
+# -----------------------------------------------------------------------------
+# Connection management
+# -----------------------------------------------------------------------------
 def get_conn() -> sqlite3.Connection:
+    """Create and return a SQLite connection configured for the app (WAL/FKs/timeouts)."""
     # timeout + busy_timeout makes resets / writes more reliable on Windows
     conn = sqlite3.connect(str(DB_PATH), timeout=_DB_TIMEOUT_S, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -26,11 +47,14 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
-
+# -----------------------------------------------------------------------------
+# Database schema initialization
+# -----------------------------------------------------------------------------
 def init_db() -> None:
     """Create tables if they don't exist."""
     conn = get_conn()
     try:
+        # patients table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS patients (
@@ -50,7 +74,7 @@ def init_db() -> None:
             );
             """
         )
-
+        # transcripts table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transcripts (
@@ -63,7 +87,7 @@ def init_db() -> None:
             );
             """
         )
-
+        # notes table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS notes (
@@ -78,7 +102,7 @@ def init_db() -> None:
             """
         )
 
-        # Assistant Q/A messages (patient-bound)
+        # Assistant Q/A messages table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS assistant_messages (
@@ -95,9 +119,7 @@ def init_db() -> None:
             );
             """
         )
-
-        # ---------------- Orders (Patient-bound, Visit-bound) ----------------
-        # Each order can optionally be linked to a specific visit/encounter (transcript_id).
+        # orders table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
@@ -120,9 +142,8 @@ def init_db() -> None:
             """
         )
 
-        # ---------------- Guidelines library (persistent RAG) ----------------
+        # guidelines_documents table 
         # Stores uploaded guideline/protocol documents that are indexed once and reused.
-        # We keep the raw file on disk and store chunk text + metadata in SQLite.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS guidelines_documents (
@@ -136,7 +157,7 @@ def init_db() -> None:
             );
             """
         )
-
+        # guidelines_chunks table 
         # Each chunk is assigned a stable INTEGER id (used by the vector index file).
         conn.execute(
             """
@@ -150,10 +171,7 @@ def init_db() -> None:
             );
             """
         )
-
-
-        # ---------------- Imaging History (persistent) ----------------
-        # Stores image analyses so clinicians can reuse outputs without re-running the model.
+        # imaging_history table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS imaging_history (
@@ -174,10 +192,11 @@ def init_db() -> None:
     finally:
         conn.close()
 
-
-# ---------------- Guidelines DB helpers ----------------
-
+# -----------------------------------------------------------------------------
+# Guidelines: documents & chunks (persistent library)
+# -----------------------------------------------------------------------------
 def get_guideline_by_sha256(sha256: str) -> Optional[Dict[str, Any]]:
+    """Return a guideline document row by its SHA-256 hash (or None)."""
     conn = get_conn()
     try:
         row = conn.execute(
@@ -188,8 +207,8 @@ def get_guideline_by_sha256(sha256: str) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def list_guidelines() -> List[Dict[str, Any]]:
+    """List all stored guideline documents, newest first."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -199,13 +218,13 @@ def list_guidelines() -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def create_guideline_document(
     original_filename: str,
     sha256: str,
     storage_path: str,
     size_bytes: int,
 ) -> Dict[str, Any]:
+    """Insert a guideline document metadata row and return the created record."""
     conn = get_conn()
     try:
         conn.execute(
@@ -223,8 +242,8 @@ def create_guideline_document(
     finally:
         conn.close()
 
-
 def update_guideline_chunk_count(doc_id: int, chunk_count: int) -> None:
+    """Update the stored chunk_count for a guideline document."""
     conn = get_conn()
     try:
         conn.execute(
@@ -235,8 +254,8 @@ def update_guideline_chunk_count(doc_id: int, chunk_count: int) -> None:
     finally:
         conn.close()
 
-
 def insert_guideline_chunk(doc_id: int, text: str, page: Optional[int]) -> int:
+    """Insert a guideline chunk and return the new chunk id."""
     conn = get_conn()
     try:
         conn.execute(
@@ -249,8 +268,8 @@ def insert_guideline_chunk(doc_id: int, text: str, page: Optional[int]) -> int:
     finally:
         conn.close()
 
-
 def get_guideline(doc_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a guideline document record by id (or None)."""
     conn = get_conn()
     try:
         row = conn.execute("SELECT * FROM guidelines_documents WHERE id = ?;", (int(doc_id),)).fetchone()
@@ -258,8 +277,8 @@ def get_guideline(doc_id: int) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def delete_guideline_document(doc_id: int) -> None:
+    """Delete a guideline document (cascades to its chunks via FK)."""
     conn = get_conn()
     try:
         conn.execute("DELETE FROM guidelines_documents WHERE id = ?;", (int(doc_id),))
@@ -267,8 +286,8 @@ def delete_guideline_document(doc_id: int) -> None:
     finally:
         conn.close()
 
-
 def list_chunk_ids_for_doc(doc_id: int) -> List[int]:
+    """Return all chunk ids for a given guideline document id."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -279,8 +298,8 @@ def list_chunk_ids_for_doc(doc_id: int) -> List[int]:
     finally:
         conn.close()
 
-
 def fetch_guideline_chunks_by_ids(chunk_ids: List[int]) -> List[Dict[str, Any]]:
+    """Fetch guideline chunks for a list of ids, including the source filename."""
     if not chunk_ids:
         return []
     conn = get_conn()
@@ -300,12 +319,15 @@ def fetch_guideline_chunks_by_ids(chunk_ids: List[int]) -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-
+# -----------------------------------------------------------------------------
+# Internal helpers: row mappers & parsers
+# -----------------------------------------------------------------------------
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert a sqlite3.Row to a plain Python dict."""
     return {k: row[k] for k in row.keys()}
 
-
 def _row_to_order(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert an order row to dict and decode details_json into details."""
     d = _row_to_dict(row)
     try:
         d["details"] = json.loads(d.get("details_json") or "{}")
@@ -314,10 +336,11 @@ def _row_to_order(row: sqlite3.Row) -> Dict[str, Any]:
     d.pop("details_json", None)
     return d
 
-
-# ---------------- Patients ----------------
-
+# -----------------------------------------------------------------------------
+# Patients (CRUD)
+# -----------------------------------------------------------------------------
 def list_patients() -> List[Dict[str, Any]]:
+    """List patients, newest first."""
     conn = get_conn()
     try:
         rows = conn.execute("SELECT * FROM patients ORDER BY created_at DESC, id DESC;").fetchall()
@@ -325,8 +348,8 @@ def list_patients() -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def get_patient(patient_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a single patient record by id (or None)."""
     conn = get_conn()
     try:
         row = conn.execute("SELECT * FROM patients WHERE id = ?;", (patient_id,)).fetchone()
@@ -334,8 +357,8 @@ def get_patient(patient_id: int) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def create_patient(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a patient from the given payload dict and return the created record."""
     conn = get_conn()
     try:
         conn.execute(
@@ -366,7 +389,6 @@ def create_patient(payload: Dict[str, Any]) -> Dict[str, Any]:
     finally:
         conn.close()
 
-
 def delete_patient(patient_id: int) -> None:
     """Delete a patient and all related rows (via ON DELETE CASCADE)."""
     conn = get_conn()
@@ -376,10 +398,11 @@ def delete_patient(patient_id: int) -> None:
     finally:
         conn.close()
 
-
-# ---------------- Orders ----------------
-
+# -----------------------------------------------------------------------------
+# Orders (CRUD + de-dup)
+# -----------------------------------------------------------------------------
 def list_orders(patient_id: int, transcript_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """List orders for a patient."""
     conn = get_conn()
     try:
         if transcript_id is None:
@@ -404,8 +427,8 @@ def list_orders(patient_id: int, transcript_id: Optional[int] = None) -> List[Di
     finally:
         conn.close()
 
-
 def get_order(order_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a single order by id (or None)."""
     conn = get_conn()
     try:
         row = conn.execute("SELECT * FROM orders WHERE id = ?;", (int(order_id),)).fetchone()
@@ -413,8 +436,8 @@ def get_order(order_id: int) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def _order_exists(patient_id: int, transcript_id: Optional[int], category: str, title: str) -> bool:
+    """Check whether an order already exists for (patient, transcript, category, title)."""
     conn = get_conn()
     try:
         row = conn.execute(
@@ -431,7 +454,6 @@ def _order_exists(patient_id: int, transcript_id: Optional[int], category: str, 
         return bool(row)
     finally:
         conn.close()
-
 
 def create_order(
     patient_id: int,
@@ -487,8 +509,8 @@ def create_order(
     finally:
         conn.close()
 
-
 def update_order(order_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Update allowed order fields and return the updated record."""
     allowed = {
         "category",
         "title",
@@ -526,12 +548,12 @@ def update_order(order_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
     finally:
         conn.close()
 
-
 def update_order_status(order_id: int, status: str) -> Dict[str, Any]:
+    """Convenience wrapper to update an order's status."""
     return update_order(int(order_id), {"status": (status or "").strip()})
 
-
 def delete_order(order_id: int) -> None:
+    """Delete an order by id."""
     conn = get_conn()
     try:
         conn.execute("DELETE FROM orders WHERE id = ?;", (int(order_id),))
@@ -539,10 +561,11 @@ def delete_order(order_id: int) -> None:
     finally:
         conn.close()
 
-
-# ---------------- Transcripts ----------------
-
+# -----------------------------------------------------------------------------
+# Transcripts (Encounters)
+# -----------------------------------------------------------------------------
 def list_transcripts(patient_id: int) -> List[Dict[str, Any]]:
+    """List transcripts (encounters) for a patient, newest first."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -558,25 +581,8 @@ def list_transcripts(patient_id: int) -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-
-def get_transcript_for_patient(patient_id: int, transcript_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch a single transcript that belongs to a given patient."""
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            """
-            SELECT id, patient_id, text, audio_filename, created_at
-            FROM transcripts
-            WHERE patient_id = ? AND id = ?;
-            """,
-            (patient_id, transcript_id),
-        ).fetchone()
-        return _row_to_dict(row) if row else None
-    finally:
-        conn.close()
-
-
 def create_transcript(patient_id: int, text: str, audio_filename: Optional[str] = None) -> Dict[str, Any]:
+    """Create a transcript record for a patient and return it."""
     conn = get_conn()
     try:
         conn.execute(
@@ -595,9 +601,6 @@ def create_transcript(patient_id: int, text: str, audio_filename: Optional[str] 
         return _row_to_dict(row)
     finally:
         conn.close()
-
-
-
 
 def delete_transcript_visit(patient_id: int, transcript_id: int) -> Dict[str, Any]:
     """Delete a transcript (encounter) and all visit-linked records.
@@ -656,9 +659,11 @@ def delete_transcript_visit(patient_id: int, transcript_id: int) -> Dict[str, An
     finally:
         conn.close()
 
-# ---------------- Notes ----------------
-
+# -----------------------------------------------------------------------------
+# Notes (CRUD)
+# -----------------------------------------------------------------------------
 def list_notes(patient_id: int) -> List[Dict[str, Any]]:
+    """List saved notes (e.g., SOAP) for a patient, newest first."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -674,13 +679,13 @@ def list_notes(patient_id: int) -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def create_note(
     patient_id: int,
     note_type: str,
     content: str,
     source_transcript_id: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Create a note record and return it."""
     conn = get_conn()
     try:
         conn.execute(
@@ -703,9 +708,9 @@ def create_note(
     finally:
         conn.close()
 
-
-# ---------------- Assistant Messages ----------------
-
+# -----------------------------------------------------------------------------
+# Assistant messages (Q/A history)
+# -----------------------------------------------------------------------------
 def list_assistant_messages(patient_id: int, limit: int = 20) -> List[Dict[str, Any]]:
     """List most recent assistant Q/A messages for a patient."""
     conn = get_conn()
@@ -750,7 +755,6 @@ def list_assistant_messages(patient_id: int, limit: int = 20) -> List[Dict[str, 
         return out
     finally:
         conn.close()
-
 
 def create_assistant_message(
     patient_id: int,
@@ -815,7 +819,6 @@ def create_assistant_message(
     finally:
         conn.close()
 
-
 def delete_assistant_message(patient_id: int, message_id: int) -> Dict[str, Any]:
     """Delete a single assistant Q/A message for a patient."""
     conn = get_conn()
@@ -844,10 +847,11 @@ def delete_assistant_message(patient_id: int, message_id: int) -> Dict[str, Any]
     finally:
         conn.close()
 
-
-# ---------------- Imaging History ----------------
-
+# -----------------------------------------------------------------------------
+# Imaging history
+# -----------------------------------------------------------------------------
 def _row_to_imaging_history(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert an imaging_history row to a dict."""
     return _row_to_dict(row)
 
 
@@ -860,6 +864,7 @@ def create_imaging_history(
     result_text: str,
     model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Insert an imaging analysis result and return the created record."""
     conn = get_conn()
     try:
         conn.execute(
@@ -895,11 +900,11 @@ def create_imaging_history(
     finally:
         conn.close()
 
-
 def list_imaging_history(
     limit: int = 50,
     patient_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """List imaging history (optionally by patient), newest first."""
     limit_n = int(limit) if int(limit) > 0 else 50
     limit_n = min(limit_n, 200)
 
@@ -933,8 +938,8 @@ def list_imaging_history(
     finally:
         conn.close()
 
-
 def get_imaging_history(history_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a single imaging history record by id (or None)."""
     conn = get_conn()
     try:
         row = conn.execute(
@@ -950,8 +955,8 @@ def get_imaging_history(history_id: int) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-
 def delete_imaging_history(history_id: int) -> bool:
+    """Delete an imaging history record. Returns True if it existed and was deleted."""
     conn = get_conn()
     try:
         row = conn.execute(

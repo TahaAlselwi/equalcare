@@ -1,3 +1,20 @@
+"""
+EqualCare Backend (FastAPI)
+
+This is the local API service used by the Electron + React desktop application.
+
+High-level responsibilities:
+- Patient CRUD (SQLite)
+- Visit transcripts (ASR/diarization) + persistence
+- Notes (SOAP draft + save)
+- Orders extraction from transcript + manual order management
+- Clinical Assistant Q&A (optional patient context + optional guidelines RAG)
+- Imaging analysis + imaging history (store image on disk, metadata in SQLite)
+
+"""
+# -----------------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------------
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, HTTPException, Form
@@ -9,14 +26,14 @@ import os
 import hashlib
 
 from .transcript_service import diarize_and_transcribe, transcribe_wav_bytes
-from .notes_service import summarize_conversation, generate_structured_soap, structured_soap_to_narrative
+from .notes_service import generate_structured_soap, structured_soap_to_narrative
+from .orders_service import extract_orders_from_transcript
 from .image_service import analyze_image_bytes, DEFAULT_PROMPT
-from .assistant_service import answer_question_simple
+from .assistant_service import answer_question_simple, answer_question_with_persistent_guidelines_rag
 from .guidelines_service import (
     list_guideline_documents,
     add_guideline_file,
     remove_guideline_file,
-    answer_question_with_persistent_guidelines_rag,
 )
 from .db import (
     init_db,
@@ -25,7 +42,6 @@ from .db import (
     create_patient,
     delete_patient,
     list_transcripts,
-    get_transcript_for_patient,
     create_transcript,
     delete_transcript_visit,
     list_notes,
@@ -45,13 +61,13 @@ from .db import (
     delete_imaging_history,
 )
 
-from .orders_service import extract_orders_from_transcript
-
-
+# -----------------------------------------------------------------------------
+# App initialization
+# -----------------------------------------------------------------------------
 
 app = FastAPI()
 
-# Allow React dev server to call the API
+# Allow React dev server to call the API (useful in development).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -66,11 +82,16 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    # Create DB + tables
+    """Create SQLite DB + tables on app startup."""
     init_db()
 
 
+# -----------------------------------------------------------------------------
+# Pydantic schemas (request payloads)
+# -----------------------------------------------------------------------------
+
 class PatientCreate(BaseModel):
+    """Payload used to create a patient row."""
     full_name: str
     age: Optional[int] = None
     sex: Optional[str] = None  # "M"/"F"
@@ -85,6 +106,7 @@ class PatientCreate(BaseModel):
 
 
 class OrderCreate(BaseModel):
+    """Payload used to create an order row."""
     transcript_id: Optional[int] = None
     category: str
     title: str
@@ -97,6 +119,7 @@ class OrderCreate(BaseModel):
 
 
 class OrderPatch(BaseModel):
+    """Partial update payload for an order row."""
     transcript_id: Optional[int] = None
     category: Optional[str] = None
     title: Optional[str] = None
@@ -108,19 +131,26 @@ class OrderPatch(BaseModel):
 
 
 class OrderStatusPatch(BaseModel):
+    """Minimal payload to update only the status field."""
     status: str
 
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
+    """Health check used by the desktop app to verify the backend is up."""
     return {"ok": True}
 
 
-# ---------------- Dictation (Dashboard) ----------------
+# -----------------------------------------------------------------------------
+# Dictation
+# -----------------------------------------------------------------------------
 
 @app.post("/dictation")
 async def dictation(file: UploadFile = File(...)):
-    """Simple dictation ASR (no diarization). Used by Dashboard 'Voice Dictation'."""
+    """Simple dictation ASR."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
@@ -134,14 +164,14 @@ async def dictation(file: UploadFile = File(...)):
     text = transcribe_wav_bytes(data)
     return {"text": text}
 
-
-# ---------------- Guidelines Library (Persistent) ----------------
+# -----------------------------------------------------------------------------
+# Guidelines Library (Persistent)
+# -----------------------------------------------------------------------------
 
 @app.get("/guidelines")
 def guidelines_list():
     """List indexed guideline/protocol documents."""
     return list_guideline_documents()
-
 
 @app.post("/guidelines/upload")
 async def guidelines_upload(files: list[UploadFile] = File(...)):
@@ -173,7 +203,6 @@ async def guidelines_upload(files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail="Files were empty or unreadable")
     return out
 
-
 @app.delete("/guidelines/{doc_id}")
 def guidelines_delete(doc_id: int):
     """Remove a guideline document and delete its chunks from the persistent index."""
@@ -185,8 +214,9 @@ def guidelines_delete(doc_id: int):
         raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True}
 
-
-# ---------------- Clinical Assistant ----------------
+# -----------------------------------------------------------------------------
+# Clinical Assistant
+# -----------------------------------------------------------------------------
 
 @app.post("/assistant/ask")
 async def assistant_ask(
@@ -197,11 +227,12 @@ async def assistant_ask(
     save_interaction: bool = Form(True),
     guideline_files: Optional[list[UploadFile]] = File(None),
 ):
-    """Simple Q&A endpoint for the Clinical Assistant page.
+    """Q&A endpoint for the Clinical Assistant page.
 
-    Phase 1: Guidelines RAG only (request-time).
-    - If use_guidelines=True, the endpoint expects guideline_files[] (PDF/TXT/DOCX) and performs RAG over them.
-    - Persisted guideline libraries + patient-record RAG can be added later.
+    Notes:
+    - Patient context is *not* RAG: it attaches basic patient fields + last transcript + last note.
+    - Guidelines uses the *persistent* guideline library. If guideline_files are provided here,
+      they are indexed first (deduped) and then the question is answered using the persistent index.
 
     Returns:
       {
@@ -212,6 +243,7 @@ async def assistant_ask(
         "message": Optional[dict]  # present only if saved
       }
     """
+
 
     q = (question or "").strip()
     if not q:
@@ -292,10 +324,10 @@ async def assistant_ask(
                 }
             )
 
-    # Decide mode
+    # Decide mode (used by UI to show which sources were used).
     mode = "both" if (use_patient_context and use_guidelines) else "patient" if use_patient_context else "guidelines" if use_guidelines else "none"
 
-    # Guidelines RAG (Phase 1.5): persistent guideline library
+    # Guidelines RAG (persistent guideline library)
     if use_guidelines:
         # Optional compatibility: if files are uploaded with the ask request,
         # we index them persistently first (dedupe by SHA256), then answer using the persistent index.
@@ -328,7 +360,7 @@ async def assistant_ask(
         guideline_sources = rag_resp.get("sources") or []
         confidence = (rag_resp.get("confidence") or "").strip() or None
 
-        # Merge sources
+        # Merge sources (patient evidence + guideline citations)
         merged_sources = [*patient_sources, *guideline_sources]
 
         # Fallback confidence
@@ -385,18 +417,18 @@ async def assistant_ask(
         "message": saved,
     }
 
-
 @app.get("/patients/{patient_id}/assistant/messages")
 def patient_assistant_messages(patient_id: int, limit: int = 20):
+    """List assistant messages for a patient (most recent first)."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
     limit = max(1, min(int(limit), 200))
     return list_assistant_messages(patient_id=patient_id, limit=limit)
 
-
 @app.delete("/patients/{patient_id}/assistant/messages/{message_id}")
 def patient_assistant_messages_delete(patient_id: int, message_id: int):
+    """Delete a single assistant message row for a patient."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -407,24 +439,26 @@ def patient_assistant_messages_delete(patient_id: int, message_id: int):
 
     return result
 
-
-# ---------------- Patients ----------------
+# -----------------------------------------------------------------------------
+# Patients
+# -----------------------------------------------------------------------------
 
 @app.get("/patients")
 def patients_list():
+    """List all patients."""
     return list_patients()
-
 
 @app.get("/patients/{patient_id}")
 def patients_get(patient_id: int):
+    """Get a patient row by id."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
     return p
 
-
 @app.post("/patients")
 def patients_create(payload: PatientCreate):
+    """Create a patient row."""
     return create_patient(payload.model_dump())
 
 @app.delete("/patients/{patient_id}")
@@ -436,17 +470,17 @@ def patients_delete(patient_id: int):
     delete_patient(patient_id)
     return {"ok": True, "deleted_id": patient_id}
 
-
-
-# ---------------- Transcripts (Patient-bound) ----------------
+# -----------------------------------------------------------------------------
+# Transcripts (Patient-bound)
+# -----------------------------------------------------------------------------
 
 @app.get("/patients/{patient_id}/transcripts")
 def patient_transcripts(patient_id: int):
+    """List transcripts (visits) for a patient."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
     return list_transcripts(patient_id)
-
 
 @app.delete("/patients/{patient_id}/transcripts/{transcript_id}")
 def patient_transcripts_delete(patient_id: int, transcript_id: int):
@@ -460,9 +494,9 @@ def patient_transcripts_delete(patient_id: int, transcript_id: int):
         raise HTTPException(status_code=404, detail=(result or {}).get("detail", "Transcript not found"))
     return result
 
-
 @app.post("/patients/{patient_id}/transcripts/audio")
 async def patient_transcript_from_audio(patient_id: int, file: UploadFile = File(...)):
+    """Create a transcript from uploaded audio, then auto-generate SOAP + Orders."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -480,7 +514,7 @@ async def patient_transcript_from_audio(patient_id: int, file: UploadFile = File
     text = diarize_and_transcribe(data)
     item = create_transcript(patient_id=patient_id, text=text, audio_filename=file.filename)
 
-    # ✅ Auto-generate + save a SOAP note right after transcription (no manual buttons in Notes).
+    # ✅ Auto-generate + save a SOAP note right after transcription.
     # This is synchronous so the Notes page can immediately show the saved summary.
     if (text or "").strip():
         # Notes
@@ -497,7 +531,7 @@ async def patient_transcript_from_audio(patient_id: int, file: UploadFile = File
             # Keep transcript creation robust even if note generation fails.
             print(f"[WARN] Auto note generation failed: {e}")
 
-        # Orders (based on transcript text, not SOAP)
+        # Orders (based on transcript text)
         try:
             tid = int(item.get("id")) if item.get("id") is not None else None
             if tid is not None:
@@ -522,20 +556,21 @@ async def patient_transcript_from_audio(patient_id: int, file: UploadFile = File
 
     return item
 
-
-# ---------------- Orders (Patient-bound, Visit-bound) ----------------
-
+# -----------------------------------------------------------------------------
+# Orders
+# -----------------------------------------------------------------------------
 
 @app.get("/patients/{patient_id}/orders")
 def patient_orders(patient_id: int, transcript_id: Optional[int] = None):
+    """List orders for a patient."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
     return list_orders(patient_id=patient_id, transcript_id=transcript_id)
 
-
 @app.post("/patients/{patient_id}/orders")
 def patient_orders_create(patient_id: int, payload: OrderCreate):
+    """Create an order row (manual entry from UI)."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -563,9 +598,9 @@ def patient_orders_create(patient_id: int, payload: OrderCreate):
         raise HTTPException(status_code=409, detail="Duplicate order")
     return item
 
-
 @app.patch("/orders/{order_id}")
 def orders_patch(order_id: int, payload: OrderPatch):
+    """Patch an order with provided fields."""
     current = get_order(int(order_id))
     if not current:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -578,9 +613,9 @@ def orders_patch(order_id: int, payload: OrderPatch):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
 @app.patch("/orders/{order_id}/status")
 def orders_patch_status(order_id: int, payload: OrderStatusPatch):
+    """Update only the status field."""
     current = get_order(int(order_id))
     if not current:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -589,9 +624,9 @@ def orders_patch_status(order_id: int, payload: OrderStatusPatch):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
 @app.delete("/orders/{order_id}")
 def orders_delete(order_id: int):
+    """Delete an order row."""
     current = get_order(int(order_id))
     if not current:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -599,184 +634,21 @@ def orders_delete(order_id: int):
     return {"ok": True}
 
 
-# ---------------- Notes (Patient-bound) ----------------
+# -----------------------------------------------------------------------------
+# Notes (Patient-bound)
+# -----------------------------------------------------------------------------
 
 @app.get("/patients/{patient_id}/notes")
 def patient_notes(patient_id: int):
+    """List notes for a patient."""
     p = get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
     return list_notes(patient_id)
 
-
-@app.post("/patients/{patient_id}/notes")
-async def patient_notes_create(
-    patient_id: int,
-    note_type: str = Form("SOAP"),
-    content: str = Form(...),
-    source_transcript_id: Optional[int] = Form(None),
-):
-    """Create a note row (used by Notes Draft -> Save).
-
-    We keep it simple: caller provides final note text (already reviewed/edited).
-    """
-    p = get_patient(patient_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    text = (content or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Content is required")
-    if len(text) > 300_000:
-        raise HTTPException(status_code=413, detail="Text too large")
-
-    item = create_note(
-        patient_id=patient_id,
-        note_type=(note_type or "SOAP"),
-        content=text,
-        source_transcript_id=int(source_transcript_id) if source_transcript_id is not None else None,
-    )
-    return item
-
-
-@app.post("/patients/{patient_id}/notes/soap_structured_draft_from_transcript")
-async def patient_notes_structured_soap_draft_from_transcript(
-    patient_id: int,
-    transcript_id: int = Form(...),
-):
-    """Generate a structured SOAP draft (JSON) from a saved transcript.
-
-    This does NOT save a note. The UI allows editing fields first, then saving.
-    """
-    p = get_patient(patient_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    tr = get_transcript_for_patient(patient_id=patient_id, transcript_id=int(transcript_id))
-    if not tr:
-        raise HTTPException(status_code=404, detail="Transcript not found for this patient")
-
-    text = (tr.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Transcript is empty")
-    if len(text) > 200_000:
-        raise HTTPException(status_code=413, detail="Text too large")
-
-    structured = generate_structured_soap(text)
-    return {"structured": structured}
-
-
-@app.post("/patients/{patient_id}/notes/soap")
-async def patient_notes_soap(
-    patient_id: int,
-    file: UploadFile = File(...),
-    source_transcript_id: Optional[int] = Form(None),
-):
-    p = get_patient(patient_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
-
-    text = text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="TXT file has no readable content")
-
-    if len(text) > 200_000:
-        raise HTTPException(status_code=413, detail="Text too large")
-
-    soap = summarize_conversation(text)
-
-    item = create_note(
-        patient_id=patient_id,
-        note_type="SOAP",
-        content=soap,
-        source_transcript_id=source_transcript_id,
-    )
-    return item
-
-
-@app.post("/patients/{patient_id}/notes/soap_from_transcript")
-async def patient_notes_soap_from_transcript(
-    patient_id: int,
-    transcript_id: int = Form(...),
-):
-    """Generate + save a SOAP note directly from a saved transcript (no TXT upload)."""
-    p = get_patient(patient_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    tr = get_transcript_for_patient(patient_id=patient_id, transcript_id=int(transcript_id))
-    if not tr:
-        raise HTTPException(status_code=404, detail="Transcript not found for this patient")
-
-    text = (tr.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Transcript is empty")
-    if len(text) > 200_000:
-        raise HTTPException(status_code=413, detail="Text too large")
-
-    soap = summarize_conversation(text)
-    item = create_note(
-        patient_id=patient_id,
-        note_type="SOAP",
-        content=soap,
-        source_transcript_id=int(transcript_id),
-    )
-    return item
-
-
-# ---------------- Existing endpoints (unchanged behavior) ----------------
-
-@app.post("/transcript")
-async def transcript(file: UploadFile = File(...)):
-    """Legacy endpoint (not patient-bound). Keeps backward compatibility."""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    text = diarize_and_transcribe(data)
-    return {"transcript": text}
-
-
-@app.post("/notes/soap")
-async def notes_soap(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
-
-    text = text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="TXT file has no readable content")
-
-    if len(text) > 200_000:
-        raise HTTPException(status_code=413, detail="Text too large")
-
-    soap = summarize_conversation(text)
-    return {"soap": soap}
-
-
+# -----------------------------------------------------------------------------
+# Imaging 
+# -----------------------------------------------------------------------------
 @app.post("/imaging/analyze")
 async def imaging_analyze(
     file: UploadFile = File(...),
@@ -799,21 +671,18 @@ async def imaging_analyze(
 
     return {"result": text}
 
-
-# ---------------- Imaging History ----------------
-
 def _sha256_bytes(data: bytes) -> str:
+    """Return SHA256 hex digest for raw bytes (used for dedupe)."""
     h = hashlib.sha256()
     h.update(data)
     return h.hexdigest()
 
-
 @app.get("/imaging/history")
 def imaging_history_list(limit: int = 50, patient_id: Optional[int] = None):
+    """List imaging history items (image bytes served via /imaging/history/{id}/image)."""
     items = list_imaging_history(limit=limit, patient_id=patient_id)
     # The image bytes are served via /imaging/history/{id}/image
     return {"items": items}
-
 
 @app.post("/imaging/history")
 async def imaging_history_save(
@@ -823,6 +692,10 @@ async def imaging_history_save(
     patient_id: Optional[int] = Form(None),
     model_name: Optional[str] = Form(None),
 ):
+    """Save an imaging analysis output to history.
+
+    Stores the raw image on disk (deduped by sha256) and persists metadata in SQLite.
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
@@ -869,9 +742,9 @@ async def imaging_history_save(
     )
     return {"item": rec}
 
-
 @app.get("/imaging/history/{history_id}/image")
 def imaging_history_image(history_id: int):
+    """Serve the stored image bytes for a history row."""
     rec = get_imaging_history(history_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Not found")
@@ -880,9 +753,9 @@ def imaging_history_image(history_id: int):
         raise HTTPException(status_code=404, detail="Image file not found")
     return FileResponse(path)
 
-
 @app.delete("/imaging/history/{history_id}")
 def imaging_history_delete(history_id: int):
+    """Delete an imaging history row (and garbage-collect stored file if unreferenced)."""
     rec = get_imaging_history(history_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Not found")

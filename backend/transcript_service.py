@@ -1,5 +1,3 @@
-# backend/transcript_service.py
-
 """
 Audio transcription utilities.
 
@@ -8,6 +6,9 @@ This module provides:
 - diarize_and_transcribe: speaker diarization + per-segment ASR, returned as dialog lines.
 """
 
+# -----------------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------------
 from __future__ import annotations
 
 import os
@@ -23,10 +24,9 @@ from pyannote.audio import Pipeline
 from transformers import pipeline as hf_pipeline
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # Constants
-# =========================
-
+# -----------------------------------------------------------------------------
 ASR_TARGET_SR: int = 16000
 DICTATION_CHUNK_S: int = 20
 DICTATION_STRIDE_S: int = 4
@@ -40,9 +40,9 @@ MIN_SEGMENT_DUR_S: float = 0.30
 DEFAULT_NUM_SPEAKERS: int = 2
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # ASR text cleaning
-# =========================
+# -----------------------------------------------------------------------------
 
 _END_TOKEN_RE = re.compile(r"</s>\s*")
 
@@ -59,9 +59,9 @@ def clean_asr_text(text: str) -> str:
     return text.strip()
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # Data structures
-# =========================
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Segment:
@@ -71,9 +71,9 @@ class Segment:
     end: float
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # RTTM helpers
-# =========================
+# -----------------------------------------------------------------------------
 
 def read_rttm_to_segments(rttm_path: str) -> List[Segment]:
     """
@@ -126,14 +126,13 @@ def merge_adjacent_segments(segments: List[Segment], max_gap: float = MERGE_MAX_
     return merged
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # Audio helpers
-# =========================
+# -----------------------------------------------------------------------------
 
 def clamp(v: int, lo: int, hi: int) -> int:
     """Clamp integer v to [lo, hi]."""
     return max(lo, min(hi, v))
-
 
 def _asr_input_resampled(
     waveform: torch.Tensor,
@@ -164,7 +163,6 @@ def chunk_to_asr_input(waveform: torch.Tensor, sr: int) -> Dict[str, object]:
     """Prepare ASR input dict and resample to ASR_TARGET_SR for model compatibility."""
     return _asr_input_resampled(waveform, sr, target_sr=ASR_TARGET_SR)
 
-
 def build_dialog_lines(items: List[Dict[str, str]]) -> str:
     """
     Merge consecutive entries with the same tag and format as dialog lines:
@@ -187,15 +185,14 @@ def build_dialog_lines(items: List[Dict[str, str]]) -> str:
     return "\n".join(f"{m['tag']}: {m['text']}" for m in merged) if merged else ""
 
 
-# =========================
+# -----------------------------------------------------------------------------
 # Cached model loaders
-# =========================
+# -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def get_diarization_pipeline() -> Pipeline:
     """Load and cache pyannote diarization pipeline."""
     return Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-
 
 @lru_cache(maxsize=1)
 def get_asr_pipeline():
@@ -203,9 +200,9 @@ def get_asr_pipeline():
     return hf_pipeline("automatic-speech-recognition", model="google/medasr")
 
 
-# =========================
-# Public API functions
-# =========================
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 
 def transcribe_wav_bytes(wav_bytes: bytes) -> str:
     """
@@ -225,7 +222,6 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
         res = asr_pipe(asr_inp, chunk_length_s=DICTATION_CHUNK_S, stride_length_s=DICTATION_STRIDE_S)
         raw = (res.get("text", "") or "")
         return clean_asr_text(raw)
-
 
 def diarize_and_transcribe(wav_bytes: bytes) -> str:
     """

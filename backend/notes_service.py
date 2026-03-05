@@ -1,23 +1,32 @@
-"""Notes generation services.
-
-This module intentionally stays *offline-first* by relying on the local Ollama runtime.
-
-We support:
-1) Free-form SOAP summary (legacy)
-2) Structured SOAP (Subjective/Objective/Assessment/Plan) returned as JSON for editable fields.
 """
+Notes / SOAP generation utilities.
 
+What this module provides
+-------------------------
+Structured SOAP (JSON) extraction:
+   - `generate_structured_soap(...)` returns a strict, UI-editable JSON structure.
+   - `structured_soap_to_narrative(...)` converts that structure into a stable narrative note.
+
+"""
+# -----------------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------------
 from __future__ import annotations
 
 import json
 import re
 from typing import Dict
 
-from ollama import chat  # pip install ollama
+from ollama import chat 
 
+# -----------------------------------------------------------------------------
+# Model configuration
+# -----------------------------------------------------------------------------
 NOTE_MODEL_NAME = "MedAIBase/MedGemma1.0:4b"
 
-
+# -----------------------------------------------------------------------------
+# SOAP field definitions
+# -----------------------------------------------------------------------------
 SUBJECTIVE_FIELDS: Dict[str, str] = {
     "chief_complaints": "Chief Complaint(s)",
     "hpi": "HPI",
@@ -47,29 +56,16 @@ PLAN_FIELDS: Dict[str, str] = {
     "next_appointment": "Next Appointment",
 }
 
-
-def build_soap_prompt(conversation_text: str) -> str:
-    return (
-        "You are a medical conversation summarizer.\n\n"
-        "Summarize the following conversation in SOAP format (Subjective, Objective, Assessment, Plan).\n\n"
-        "Conversation:\n"
-        f"{conversation_text}"
-    ).strip()
-
-
-def summarize_conversation(conversation_text: str, model_name: str = NOTE_MODEL_NAME) -> str:
-    """Legacy: free-form SOAP text."""
-    prompt = build_soap_prompt(conversation_text)
-    response = chat(model=model_name, messages=[{"role": "user", "content": prompt}])
-    return (response.message.content or "").strip()
-
+# -----------------------------------------------------------------------------
+# Structured SOAP
+# -----------------------------------------------------------------------------
 
 def _empty_section(labels: Dict[str, str]) -> Dict[str, str]:
-    # Default "Not mentioned" prevents hallucinated filling; UI can hide it on export.
+    """Create a default section dict filled with 'Not mentioned' for each field key."""
     return {k: "Not mentioned" for k in labels.keys()}
 
-
 def empty_structured_soap() -> Dict[str, Dict[str, str]]:
+    """Return an empty structured SOAP object with all fields set to 'Not mentioned'."""
     return {
         "subjective": _empty_section(SUBJECTIVE_FIELDS),
         "objective": _empty_section(OBJECTIVE_FIELDS),
@@ -78,6 +74,7 @@ def empty_structured_soap() -> Dict[str, Dict[str, str]]:
     }
 
 def build_structured_soap_prompt(conversation_text: str) -> str:
+    """Build a strict-JSON prompt for extracting a structured SOAP note from a transcript."""
     s_keys = list(SUBJECTIVE_FIELDS.keys())
     o_keys = list(OBJECTIVE_FIELDS.keys())
     a_keys = list(ASSESSMENT_FIELDS.keys())
@@ -105,7 +102,9 @@ def build_structured_soap_prompt(conversation_text: str) -> str:
         f"{conversation_text}"
     ).strip()
 
-
+# -----------------------------------------------------------------------------
+# Response parsing and coercion
+# -----------------------------------------------------------------------------
 def _extract_json_blob(text: str) -> str:
     """Best-effort extraction of a JSON object from a model response."""
     if not text:
@@ -138,7 +137,6 @@ def _coerce_structured(obj: dict) -> Dict[str, Dict[str, str]]:
 
     return out
 
-
 def generate_structured_soap(conversation_text: str, model_name: str = NOTE_MODEL_NAME) -> Dict[str, Dict[str, str]]:
     """Generate structured SOAP JSON for editable fields."""
     prompt = build_structured_soap_prompt(conversation_text)
@@ -157,7 +155,9 @@ def generate_structured_soap(conversation_text: str, model_name: str = NOTE_MODE
     # Fallback: return empty (safe) structure rather than a wrong parse.
     return empty_structured_soap()
 
-
+# -----------------------------------------------------------------------------
+# Formatting helpers
+# -----------------------------------------------------------------------------
 def structured_soap_to_narrative(structured: Dict[str, Dict[str, str]]) -> str:
     """Convert structured SOAP JSON into a stable narrative format.
 

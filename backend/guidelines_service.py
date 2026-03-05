@@ -1,8 +1,4 @@
-"""backend/guidelines_service.py
-
-Persistent Guidelines Library (Phase 1.5)
-----------------------------------------
-
+"""
 Goal
   - When a guideline file is uploaded once, we index it permanently.
   - The list of guideline titles persists across app restarts.
@@ -30,19 +26,22 @@ This is intentionally simple and offline-first. You can later upgrade to:
   - Hybrid retrieval (BM25 + vectors)
   - Per-country guideline sets and selection UI
 """
-
+# -----------------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------------
 from __future__ import annotations
 
 import hashlib
 import os
+import io
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import re
+from dataclasses import dataclass
 import numpy as np
 
 from .paths import GUIDELINES_DIR
-from .assistant_service import extract_text_from_file, chunk_text, embed_texts, call_model, build_prompt, GuidelineChunk
 from .db import (
     get_guideline_by_sha256,
     create_guideline_document,
@@ -55,35 +54,241 @@ from .db import (
     fetch_guideline_chunks_by_ids,
 )
 
+# -----------------------------------------------------------------------------
+# Configuration (models & environment variables)
+# -----------------------------------------------------------------------------
+# Lazy-loaded embedding model
+_EMBED_MODEL = None
 
-# ---------------- Storage paths ----------------
+# You can override these with environment variables
+EMBED_MODEL_NAME = os.getenv("ASSISTANT_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+# -----------------------------------------------------------------------------
+# Data structures
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class GuidelineChunk:
+    text: str
+    source_name: str
+    page: Optional[int] = None  # 1-indexed for PDF, None for non-PDF
+
+# -----------------------------------------------------------------------------
+# Text utilities
+# -----------------------------------------------------------------------------
+def _clean_text(t: str) -> str:
+    """Normalize extracted text (whitespace, nulls, line breaks) for downstream chunking/embedding."""
+    if not t:
+        return ""
+    t = t.replace("\u0000", " ")
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r" \n", "\n", t)
+    return t.strip()
+
+# -----------------------------------------------------------------------------
+# Guideline ingestion: text extraction
+# -----------------------------------------------------------------------------
+def extract_text_from_file(filename: str, data: bytes) -> List[Tuple[str, Optional[int]]]:
+    """Extract text from a guideline file.
+
+    Returns a list of (text, page) tuples.
+      - For TXT/DOCX: one item with page=None
+      - For PDF: one item per page with page=1..N
+
+    If a file yields no text, returns an empty list.
+    """
+    name = (filename or "").lower()
+
+    if name.endswith(".txt"):
+        text = _clean_text(data.decode("utf-8", errors="replace"))
+        return [(text, None)] if text else []
+
+    if name.endswith(".docx"):
+        # Lazy import to keep startup fast
+        from docx import Document
+
+        doc = Document(io.BytesIO(data))
+        parts = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+        text = _clean_text("\n".join(parts))
+        return [(text, None)] if text else []
+
+    if name.endswith(".pdf"):
+        # Lazy import
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+        out: List[Tuple[str, Optional[int]]] = []
+        for i, page in enumerate(reader.pages):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            txt = _clean_text(txt)
+            if txt:
+                out.append((txt, i + 1))
+        return out
+
+    # Fallback: try decoding as text
+    text = _clean_text(data.decode("utf-8", errors="replace"))
+    return [(text, None)] if text else []
+
+# -----------------------------------------------------------------------------
+# Guideline ingestion: chunking
+# -----------------------------------------------------------------------------
+def chunk_text(
+    text: str,
+    source_name: str,
+    page: Optional[int],
+    chunk_chars: int = 1200,
+    overlap: int = 200,
+) -> List[GuidelineChunk]:
+    """Split text into overlapping chunks.
+
+    Uses a simple sliding window (character-based) and tries to cut at a newline
+    or space near the end to reduce mid-sentence splits.
+    """
+    text = _clean_text(text)
+    if not text:
+        return []
+
+    if chunk_chars < 200:
+        chunk_chars = 200
+    overlap = max(0, min(overlap, chunk_chars - 1))
+
+    chunks: List[GuidelineChunk] = []
+    n = len(text)
+    start = 0
+
+    while start < n:
+        end = min(n, start + chunk_chars)
+
+        # Try to cut at a natural boundary
+        if end < n:
+            # Prefer paragraph boundary
+            cut = text.rfind("\n", start, end)
+            if cut == -1 or (end - cut) > 200:
+                # Otherwise cut at whitespace
+                cut = text.rfind(" ", start, end)
+            if cut != -1 and cut > start + int(chunk_chars * 0.5):
+                end = cut
+
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(GuidelineChunk(text=chunk, source_name=source_name, page=page))
+
+        if end >= n:
+            break
+
+        start = max(0, end - overlap)
+
+    return chunks
+
+# -----------------------------------------------------------------------------
+# Embeddings
+# -----------------------------------------------------------------------------
+def _get_embed_model():
+    """Lazy-load and cache the SentenceTransformer embedding model."""
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
+        _EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+    return _EMBED_MODEL
+
+def embed_texts(texts: List[str]) -> np.ndarray:
+    """Embed a list of texts into normalized float32 vectors."""
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    model = _get_embed_model()
+    emb = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    emb = np.asarray(emb, dtype=np.float32)
+    return emb
+
+# -----------------------------------------------------------------------------
+# Prompt building
+# -----------------------------------------------------------------------------
+def build_prompt(
+    question: str,
+    retrieved: List[Tuple[GuidelineChunk, float]],
+    patient_context: Optional[str] = None,
+) -> str:
+    """Build the final model prompt with patient context and retrieved guideline snippets (with citations)."""
+    context_blocks: List[str] = []
+
+    for ch, _score in retrieved:
+        label = f"{ch.source_name}"
+        if ch.page is not None:
+            label += f" (p.{ch.page})"
+
+        txt = ch.text
+        if len(txt) > 2200:
+            txt = txt[:2200].rstrip() + "…"
+
+        context_blocks.append(f"[SOURCE: {label}]\n{txt}")
+
+    guidelines_context = "\n\n".join(context_blocks) if context_blocks else ""
+
+    parts: List[str] = []
+    parts.append("You are a clinical assistant. Answer in English.")
+    parts.append(
+        "Use ONLY the provided 'GUIDELINES CONTEXT' for guideline-based statements. "
+        "If the context is insufficient, say so explicitly."
+    )
+    parts.append("Be cautious. This tool supports clinicians but does not replace professional judgment.")
+    parts.append("When you use information from the context, cite it inline like: [SOURCE: filename (p.X)].")
+
+    if patient_context:
+        parts.append("\nPATIENT CONTEXT (may be incomplete):\n" + patient_context)
+
+    if guidelines_context:
+        parts.append("\nGUIDELINES CONTEXT:\n" + guidelines_context)
+    else:
+        parts.append("\nGUIDELINES CONTEXT:\n(No guideline context provided.)")
+
+    parts.append("\nQUESTION:\n" + question.strip())
+    parts.append(
+        "\nRESPONSE REQUIREMENTS:\n"
+        "- Provide a clear, practical answer.\n"
+        "- Include red flags and when to escalate if relevant.\n"
+        "- If you reference the guideline context, include citations.\n"
+    )
+
+    return "\n".join(parts).strip()
+# -----------------------------------------------------------------------------
+# Storage paths
+# -----------------------------------------------------------------------------
 
 FILES_DIR = GUIDELINES_DIR / "files"
 INDEX_PATH = GUIDELINES_DIR / "index.npz"
 
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ---------------- In-memory index cache ----------------
-
+# -----------------------------------------------------------------------------
+# In-memory index cache
+# -----------------------------------------------------------------------------
 _LOCK = threading.Lock()
 _INDEX_CACHE: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (embeddings, chunk_ids)
 
-
 def _sha256(data: bytes) -> str:
+    """Compute SHA-256 hex digest for raw file bytes."""
     h = hashlib.sha256()
     h.update(data)
     return h.hexdigest()
 
-
 def _safe_filename(name: str) -> str:
+    """Sanitize a filename for safe on-disk storage (Windows-friendly length)."""
     # keep it simple: remove path separators and odd chars
     name = (name or "file").replace("/", "_").replace("\\", "_")
     # avoid extremely long names on Windows
     return name[:160]
 
-
+# -----------------------------------------------------------------------------
+# Index persistence (load/save)
+# -----------------------------------------------------------------------------
 def _load_index_from_disk() -> Tuple[np.ndarray, np.ndarray]:
+    """Load the persistent embeddings index from disk (or return an empty index if missing/corrupt)."""
     if not INDEX_PATH.exists():
         return np.zeros((0, 0), dtype=np.float32), np.zeros((0,), dtype=np.int64)
 
@@ -95,8 +300,8 @@ def _load_index_from_disk() -> Tuple[np.ndarray, np.ndarray]:
         return np.zeros((0, 0), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     return emb, ids
 
-
 def _save_index_to_disk(embeddings: np.ndarray, chunk_ids: np.ndarray) -> None:
+    """Persist embeddings + chunk_ids to a compressed NPZ file."""
     GUIDELINES_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         INDEX_PATH,
@@ -104,24 +309,27 @@ def _save_index_to_disk(embeddings: np.ndarray, chunk_ids: np.ndarray) -> None:
         chunk_ids=chunk_ids.astype(np.int64),
     )
 
-
+# -----------------------------------------------------------------------------
+# Index cache helpers
+# -----------------------------------------------------------------------------
 def _get_index_cached() -> Tuple[np.ndarray, np.ndarray]:
+    """Return the in-memory cached index, loading it from disk on first access."""
     global _INDEX_CACHE
     if _INDEX_CACHE is None:
         _INDEX_CACHE = _load_index_from_disk()
     return _INDEX_CACHE
 
-
 def _set_index_cached(embeddings: np.ndarray, chunk_ids: np.ndarray) -> None:
+    """Replace the in-memory cached index with the provided arrays."""
     global _INDEX_CACHE
     _INDEX_CACHE = (embeddings, chunk_ids)
 
 
-# ---------------- Public API ----------------
-
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 def list_guideline_documents() -> List[Dict[str, Any]]:
     return list_guidelines()
-
 
 def add_guideline_file(filename: str, data: bytes) -> Dict[str, Any]:
     """Add a single guideline file. If already exists (SHA256 match), skip re-indexing."""
@@ -219,8 +427,8 @@ def add_guideline_file(filename: str, data: bytes) -> Dict[str, Any]:
     assert out is not None
     return {**out, "already_exists": False}
 
-
 def remove_guideline_file(doc_id: int) -> None:
+    """Remove a guideline document, its chunks, and its vectors from the persistent index."""
     doc = get_guideline(int(doc_id))
     if not doc:
         raise ValueError("Guideline not found")
@@ -255,7 +463,6 @@ def remove_guideline_file(doc_id: int) -> None:
 
     # Delete DB row (cascades chunks)
     delete_guideline_document(int(doc_id))
-
 
 def retrieve_guideline_evidence(
     question: str,
@@ -299,36 +506,3 @@ def retrieve_guideline_evidence(
     return out
 
 
-def answer_question_with_persistent_guidelines_rag(
-    question: str,
-    patient_context: Optional[str] = None,
-    top_k: int = 6,
-) -> Dict[str, Any]:
-    retrieved = retrieve_guideline_evidence(question, top_k=top_k)
-    prompt = build_prompt(question, retrieved, patient_context=patient_context)
-    answer = call_model(prompt)
-
-    sources: List[Dict[str, Any]] = []
-    for ch, score in retrieved:
-        title = ch.source_name
-        if ch.page is not None:
-            title += f" (p.{ch.page})"
-        sources.append(
-            {
-                "kind": "guideline",
-                "title": title,
-                "source": ch.source_name,
-                "page": ch.page,
-                "score": round(float(score), 4),
-                "snippet": (ch.text[:300] + "…") if len(ch.text) > 300 else ch.text,
-                "meta": {"source_name": ch.source_name, "page": ch.page},
-            }
-        )
-
-    if not retrieved:
-        conf = "Low"
-    else:
-        best = max(float(s) for _c, s in retrieved)
-        conf = "High" if best >= 0.60 else "Medium" if best >= 0.45 else "Low"
-
-    return {"answer": answer, "answer_text": answer, "sources": sources, "confidence": conf}

@@ -45,14 +45,21 @@ equalcare/
 ├─ backend/                  # FastAPI services + local DB logic
 │  ├─ main.py                # API routes
 │  ├─ db.py                  # SQLite schema + queries
+│  ├─ paths.py                # Local filesystem paths
 │  ├─ transcript_service.py  # diarization + transcription
 │  ├─ notes_service.py       # SOAP generation
 │  ├─ orders_service.py      # auto order extraction
+│  ├─ assistant_service.py    # Q&A
 │  ├─ guidelines_service.py  # persistent guidelines RAG
 │  └─ image_service.py       # imaging analysis
 └─ electron-builder.json5    # Windows build config
 ```
+---
+## 🏗️ Architecture
 
+![Architecture Diagram](architecture1.png)
+---
+![Architecture Diagram](architecture2.png)
 ---
 ## ⚙️ Setup Instructions (Development)
 
@@ -99,11 +106,17 @@ backend\.venv\Scripts\Activate.ps1
 pip install -r backend/requirements
 ```
 
+> **Note (Windows stability):**  
+> If you face crashes after installing requirements, try removing `torchcodec`.  
+> `torchcodec` caused crashes on some Windows setups (FFmpeg/version issues).
+>
+> ```bash
+> pip uninstall -y torchcodec
+> ```
 
 ---
 
-### 4) Pull default Ollama models (optional but recommended)
-
+### 4) Pull default Ollama models
 ```bash
 # Assistant (LLM)
 ollama pull MedAIBase/MedGemma1.0:4b
